@@ -41,8 +41,36 @@ def get_http_client(timeout: float = 60.0) -> httpx.AsyncClient:
     return _global_http_client
 
 
+def _open_and_convert_image(image_data: BytesIO) -> Image.Image:
+    """
+    Open and convert image to RGB format.
+
+    This is a sync function that should be run in a thread pool to avoid
+    blocking the async event loop. PIL operations are CPU-bound and can
+    take significant time for large images.
+
+    Args:
+        image_data: BytesIO buffer containing the image data
+
+    Returns:
+        PIL Image in RGB format
+
+    Raises:
+        ValueError: If image format is not supported
+    """
+    image = Image.open(image_data)
+
+    # Validate image format
+    if image.format not in ("JPEG", "PNG", "WEBP", "GIF", "BMP", "TIFF"):
+        raise ValueError(f"Unsupported image format: {image.format}")
+
+    # Convert to RGB (handles RGBA, L, P, etc.)
+    return image.convert("RGB")
+
+
 class ImageLoader:
-    CACHE_SIZE_MAXIMUM = 8
+    # Increased cache size for high concurrency scenarios
+    CACHE_SIZE_MAXIMUM = 64
 
     def __init__(
         self, cache_size: int = CACHE_SIZE_MAXIMUM, http_timeout: float = 30.0
@@ -90,14 +118,11 @@ class ImageLoader:
             else:
                 raise ValueError(f"Invalid image source scheme: {parsed_url.scheme}")
 
-            # PIL is sync, so offload to a thread to avoid blocking the event loop
-            image = await asyncio.to_thread(Image.open, image_data)
-
-            # Validate image format and convert to RGB
-            if image.format not in ("JPEG", "PNG", "WEBP"):
-                raise ValueError(f"Unsupported image format: {image.format}")
-
-            image_converted = image.convert("RGB")
+            # PIL operations are sync and can be slow for large images.
+            # Offload to a thread pool to avoid blocking the async event loop.
+            image_converted = await asyncio.to_thread(
+                _open_and_convert_image, image_data
+            )
 
             # Cache HTTP(S) URLs
             if parsed_url.scheme in ("http", "https"):
