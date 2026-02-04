@@ -41,6 +41,12 @@ ARG ENABLE_MEDIA_NIXL
 ARG ENABLE_MEDIA_FFMPEG
 ARG CARGO_BUILD_JOBS
 
+# SGLang runtime image configuration
+# Default: CUDA 12.x for SM90 (Hopper/H100/H200)
+#
+# For SM103 (Blackwell/B100/B200), build with CUDA 13:
+#   ./build.sh --framework sglang --cuda-version 13.0.1
+# This automatically sets RUNTIME_IMAGE_TAG=v0.5.8-cu130-runtime
 ARG RUNTIME_IMAGE="lmsysorg/sglang"
 ARG RUNTIME_IMAGE_TAG="v0.5.8-runtime"
 
