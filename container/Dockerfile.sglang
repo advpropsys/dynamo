@@ -537,11 +537,11 @@ ARG ENABLE_GPU_MEMORY_SERVICE
 RUN --mount=type=bind,source=.,target=/mnt/local_src \
     --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     export PIP_CACHE_DIR=/root/.cache/pip && \
-    pip install --break-system-packages \
+    # Don't reinstall sglang - base image already has it configured with correct sgl-kernel
+    pip install --break-system-packages --no-deps \
         /opt/dynamo/wheelhouse/ai_dynamo_runtime*.whl \
         /opt/dynamo/wheelhouse/ai_dynamo*any.whl \
-        /opt/dynamo/wheelhouse/nixl/nixl*.whl \
-        sglang==${SGLANG_VERSION} && \
+        /opt/dynamo/wheelhouse/nixl/nixl*.whl && \
     if [ "${ENABLE_GPU_MEMORY_SERVICE}" = "true" ]; then \
         GMS_WHEEL=$(ls /opt/dynamo/wheelhouse/gpu_memory_service*.whl 2>/dev/null | head -1); \
         if [ -z "$GMS_WHEEL" ]; then \
@@ -555,10 +555,10 @@ RUN --mount=type=bind,source=.,target=/mnt/local_src \
 RUN --mount=type=bind,source=.,target=/mnt/local_src \
     --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     export PIP_CACHE_DIR=/root/.cache/pip && \
+    # Install deps but NOT sglang - base image already has it with correct sgl-kernel
     pip install --break-system-packages \
         --requirement /mnt/local_src/container/deps/requirements.txt \
-        --requirement /mnt/local_src/container/deps/requirements.test.txt \
-        sglang==${SGLANG_VERSION} && \
+        --requirement /mnt/local_src/container/deps/requirements.test.txt && \
     cd /workspace/benchmarks && \
     pip install --break-system-packages . && \
     #TODO: Temporary change until upstream sglang runtime image is updated
@@ -569,15 +569,16 @@ RUN --mount=type=bind,source=.,target=/mnt/local_src \
     CUDA_MAJOR=$(nvcc --version | egrep -o 'cuda_[0-9]+' | cut -d_ -f2) && \
     if [ "$CUDA_MAJOR" = "12" ]; then \
         # Install NVIDIA packages that are needed for DeepEP to work properly
-        # This is done in the upstream runtime image too, but these packages are overridden in earlier commands
-        pip install --break-system-packages --force-reinstall --no-deps \
+        # CRITICAL: --no-cache-dir required to bypass stale pip cache
+        pip install --break-system-packages --force-reinstall --no-deps --no-cache-dir \
             nvidia-nccl-cu12==2.28.3 \
             nvidia-cudnn-cu12==9.16.0.29 \
             nvidia-cutlass-dsl==4.3.5; \
     elif [ "$CUDA_MAJOR" = "13" ]; then \
-        # CUDA 13: Install CuDNN for PyTorch 2.9.1 compatibility
-        pip install --break-system-packages --force-reinstall --no-deps \
-            nvidia-nccl-cu13==2.28.3 \
+        # CUDA 13: Update NCCL/cuDNN for SM103 (Blackwell) and PyTorch 2.9.1 compatibility
+        # Base image sglang already has sgl-kernel configured - don't reinstall it
+        pip install --break-system-packages --force-reinstall --no-deps --no-cache-dir \
+            nvidia-nccl-cu13==2.29.3 \
             nvidia-cublas==13.1.0.3 \
             nvidia-cutlass-dsl==4.3.1 \
             nvidia-cudnn-cu13==9.16.0.29; \

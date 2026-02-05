@@ -1192,4 +1192,110 @@ mod tests {
             .await
             .expect("Failed to delete test stream");
     }
+
+    /// Test that consumers survive idle periods longer than inactive_threshold.
+    /// This validates PR #5861 - with 1 minute inactive_threshold, the consumer
+    /// should stay alive because the messages() stream continuously issues fetch requests.
+    #[tokio::test]
+    #[ignore]
+    async fn test_consumer_survives_idle_period() {
+        use uuid::Uuid;
+
+        let stream_name = format!("test-idle-{}", Uuid::new_v4());
+        let nats_server = "nats://localhost:4222".to_string();
+        let consumer_name = format!("idle-consumer-{}", Uuid::new_v4());
+
+        println!("Testing consumer survival with 1-minute inactive_threshold");
+        println!("Stream: {}, Consumer: {}", stream_name, consumer_name);
+
+        // Connect to NATS and clean up any existing stream
+        let client_options = Client::builder()
+            .server(nats_server.clone())
+            .build()
+            .expect("Failed to build client options");
+
+        let client = client_options
+            .connect()
+            .await
+            .expect("Failed to connect to NATS");
+
+        let _ = client.jetstream().delete_stream(&stream_name).await;
+
+        // Create queue with consumer (uses 1-minute inactive_threshold as configured)
+        let mut queue = NatsQueue::new_with_consumer(
+            stream_name.clone(),
+            nats_server.clone(),
+            time::Duration::from_secs(5), // 5 second dequeue timeout
+            consumer_name.clone(),
+        );
+        queue.connect().await.expect("Failed to connect queue");
+
+        println!("Consumer created, starting 2-minute idle period test...");
+
+        // Spawn a task that keeps trying to dequeue (simulating real consumer behavior)
+        // This is what keeps the consumer alive - the messages() stream issues fetch requests
+        let dequeue_handle: tokio::task::JoinHandle<()> = {
+            let stream_name = stream_name.clone();
+            let consumer_name = consumer_name.clone();
+            let nats_server = nats_server.clone();
+
+            tokio::spawn(async move {
+                let mut q = NatsQueue::new_with_consumer(
+                    stream_name,
+                    nats_server,
+                    time::Duration::from_secs(5),
+                    consumer_name,
+                );
+                q.connect().await.expect("Failed to connect dequeue task");
+
+                loop {
+                    match q.dequeue_task(Some(time::Duration::from_secs(10))).await {
+                        Ok(Some(_)) => println!("Unexpected message received"),
+                        Ok(None) => { /* Timeout, expected - no messages */ }
+                        Err(e) => {
+                            eprintln!("Dequeue error: {:?}", e);
+                            return;
+                        }
+                    }
+                }
+            })
+        };
+
+        // Wait 2+ minutes (longer than the 1-minute inactive_threshold)
+        let check_interval = time::Duration::from_secs(30);
+        let total_wait = time::Duration::from_secs(130); // 2 minutes 10 seconds
+        let start = std::time::Instant::now();
+
+        while start.elapsed() < total_wait {
+            tokio::time::sleep(check_interval).await;
+
+            // Verify consumer still exists
+            match queue.count_consumers().await {
+                Ok(count) => {
+                    println!(
+                        "[{:?}] Consumer check: {} consumer(s) exist",
+                        start.elapsed(),
+                        count
+                    );
+                    assert!(count >= 1, "Consumer should still exist");
+                }
+                Err(e) => {
+                    panic!("Failed to count consumers after {:?}: {:?}", start.elapsed(), e);
+                }
+            }
+        }
+
+        // Final verification
+        let final_count = queue.count_consumers().await.expect("Final count failed");
+        println!(
+            "SUCCESS: Consumer survived {:?} idle period with 1-minute inactive_threshold!",
+            start.elapsed()
+        );
+        println!("Final consumer count: {}", final_count);
+
+        // Cleanup
+        dequeue_handle.abort();
+        let _ = queue.shutdown(None).await;
+        let _ = client.jetstream().delete_stream(&stream_name).await;
+    }
 }

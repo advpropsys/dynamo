@@ -1,0 +1,3 @@
+Good point, discovery-based cleanup handles the common case. The motivation here was high-churn spot environments — when nodes get pulled frequently, each one leaves an orphaned consumer and discovery cleanup only fires on surviving routers (or on next startup). With lots of spot replacements you end up accumulating dead consumers in NATS for up to an hour.
+
+That said, 2 minutes is too aggressive — agreed. A live consumer under backpressure or with a long poll could get reaped. Would something like 10-15 minutes work as a middle ground? Enough to bound orphan buildup under churn, but safe for any live consumer.
