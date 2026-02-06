@@ -292,6 +292,27 @@ class BaseWorkerHandler(BaseGenerativeHandler):
             "prompt" if isinstance(request_input, str) else "input_ids": request_input
         }
 
+    def _abort_request(self, sglang_request_id: Optional[str]) -> None:
+        """Abort an in-flight SGLang request by ID.
+
+        Args:
+            sglang_request_id: The SGLang-internal request ID. No-op if None.
+        """
+        if sglang_request_id is None:
+            return
+        try:
+            if (
+                hasattr(self.engine, "tokenizer_manager")
+                and self.engine.tokenizer_manager
+            ):
+                self.engine.tokenizer_manager.abort_request(
+                    rid=sglang_request_id, abort_all=False
+                )
+        except Exception:
+            logging.debug(
+                "Failed to abort request %s", sglang_request_id, exc_info=True
+            )
+
     @staticmethod
     def _generate_bootstrap_room() -> int:
         """Generate a unique bootstrap room ID for disaggregated serving.

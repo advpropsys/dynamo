@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import asyncio
 import logging
 import time
 from typing import Any, AsyncGenerator, Dict
@@ -196,6 +195,10 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         With stream_output=True (enforced by Dynamo), SGLang sends disjoint segments
         containing only new tokens since the last output. We pass these through directly.
 
+        Cancellation is handled inline: context.is_stopped() is checked each iteration
+        and abort_request is called directly when detected, avoiding the overhead of a
+        background asyncio.Task per request.
+
         Args:
             stream_source: Async generator from engine.async_generate.
             context: Context object for cancellation handling.
@@ -203,52 +206,45 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         Yields:
             Dict with token_ids and optional finish_reason.
         """
-        # Use Future pattern for request ID - will be set when first response arrives
-        request_id_future = asyncio.Future()
-        async with self._cancellation_monitor(request_id_future, context):
-            async for res in stream_source:
-                # Extract SGLang request ID from the first response and set the future
-                if not request_id_future.done():
-                    meta_info = res.get("meta_info", {})
-                    sglang_request_id = meta_info.get("id")
-                    if sglang_request_id:
-                        request_id_future.set_result(sglang_request_id)
-                        logging.debug(f"New SGLang Request ID: {sglang_request_id}")
+        sglang_request_id = None
 
-                # Check cancellation before yielding to allow proper cleanup.
-                # This lets SGLang proceed to the second token generation, which will
-                # async context switch and allow the abort monitor to signal cancellation.
-                # The loop should exit by itself when context.is_stopped() returns True.
-                out = {}
-                finish_reason = res["meta_info"]["finish_reason"]
-                if finish_reason:
-                    out["finish_reason"] = finish_reason["type"]
+        async for res in stream_source:
+            meta_info = res["meta_info"]
 
-                # With stream_output=True, output_ids contains only new tokens (disjoint)
-                output_ids = res.get("output_ids", [])
-                # If request is not finished yet, but there are no outputs, return an error.
-                if not output_ids and not finish_reason:
-                    if not context.is_stopped():
-                        yield {"finish_reason": "error", "token_ids": []}
-                    break
+            if sglang_request_id is None:
+                sglang_request_id = meta_info.get("id")
 
-                # Pass through disjoint token segments directly
-                out["token_ids"] = output_ids
-                if finish_reason:
-                    input_tokens = res["meta_info"]["prompt_tokens"]
-                    completion_tokens = res["meta_info"]["completion_tokens"]
-                    cached_tokens = res["meta_info"]["cached_tokens"]
-                    prefill_prompt_tokens_details = None
-                    if cached_tokens is not None and cached_tokens > 0:
-                        prefill_prompt_tokens_details = {"cached_tokens": cached_tokens}
-                    out["completion_usage"] = {
+            # Inline cancellation: abort via engine when context signals stop.
+            if context.is_stopped():
+                self._abort_request(sglang_request_id)
+                break
+
+            finish_reason = meta_info["finish_reason"]
+
+            # With stream_output=True, output_ids contains only new tokens (disjoint)
+            output_ids = res.get("output_ids")
+            if not output_ids and not finish_reason:
+                yield {"finish_reason": "error", "token_ids": []}
+                break
+
+            if finish_reason:
+                input_tokens = meta_info["prompt_tokens"]
+                completion_tokens = meta_info["completion_tokens"]
+                cached_tokens = meta_info["cached_tokens"]
+                yield {
+                    "token_ids": output_ids,
+                    "finish_reason": finish_reason["type"],
+                    "completion_usage": {
                         "prompt_tokens": input_tokens,
                         "completion_tokens": completion_tokens,
                         "total_tokens": input_tokens + completion_tokens,
-                        "prompt_tokens_details": prefill_prompt_tokens_details,
-                    }
-                if not context.is_stopped():
-                    yield out
+                        "prompt_tokens_details": {"cached_tokens": cached_tokens}
+                        if cached_tokens
+                        else None,
+                    },
+                }
+            else:
+                yield {"token_ids": output_ids}
 
     async def _process_text_stream(
         self,
@@ -265,45 +261,38 @@ class DecodeWorkerHandler(BaseWorkerHandler):
             OpenAI-formatted chat completion chunk dicts.
         """
         count = 0
+        created_time = int(time.time())
+        model_name = self.config.server_args.served_model_name
+        sglang_request_id = None
 
-        # Use Future pattern for request ID - will be set when first response arrives
-        request_id_future = asyncio.Future()
-        async with self._cancellation_monitor(request_id_future, context):
-            async for res in stream_source:
-                # Extract SGLang request ID from the first response and set the future
-                if not request_id_future.done():
-                    meta_info = res.get("meta_info", {})
-                    sglang_request_id = meta_info.get("id")
-                    if sglang_request_id:
-                        request_id_future.set_result(sglang_request_id)
-                        logging.debug(f"New SGLang Request ID: {sglang_request_id}")
+        async for res in stream_source:
+            meta_info = res["meta_info"]
 
-                # Check cancellation before yielding to allow proper cleanup.
-                # This lets SGLang proceed to the second token generation, which will
-                # async context switch and allow the abort monitor to signal cancellation.
-                # The loop should exit by itself when context.is_stopped() returns True.
+            if sglang_request_id is None:
+                sglang_request_id = meta_info.get("id")
 
-                index = res.get("index", 0)
-                text = res.get("text", "")
+            if context.is_stopped():
+                self._abort_request(sglang_request_id)
+                break
 
-                finish_reason = res["meta_info"]["finish_reason"]
-                finish_reason_type = finish_reason["type"] if finish_reason else None
-                next_count = len(text)
-                delta = text[count:]
+            text = res.get("text", "")
+            finish_reason = meta_info["finish_reason"]
+            next_count = len(text)
+            delta = text[count:]
 
-                choice_data = {
-                    "index": index,
-                    "delta": {"role": "assistant", "content": delta},
-                    "finish_reason": finish_reason_type,
-                }
-
-                response = {
-                    "id": res["meta_info"]["id"],
-                    "created": int(time.time()),
-                    "choices": [choice_data],
-                    "model": self.config.server_args.served_model_name,
-                    "object": "chat.completion.chunk",
-                }
-                if not context.is_stopped():
-                    yield response
-                count = next_count
+            yield {
+                "id": meta_info["id"],
+                "created": created_time,
+                "choices": [
+                    {
+                        "index": res.get("index", 0),
+                        "delta": {"role": "assistant", "content": delta},
+                        "finish_reason": finish_reason["type"]
+                        if finish_reason
+                        else None,
+                    }
+                ],
+                "model": model_name,
+                "object": "chat.completion.chunk",
+            }
+            count = next_count
