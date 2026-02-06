@@ -24,6 +24,7 @@ use futures::Stream;
 use futures::stream::{self, StreamExt};
 use prompt::OAIPromptFormatter;
 use std::{collections::HashMap, pin::Pin, sync::Arc};
+use tokio::sync::Semaphore;
 use tracing;
 
 use crate::model_card::{ModelDeploymentCard, ModelInfo};
@@ -117,6 +118,12 @@ pub struct OpenAIPreprocessor {
     /// Per-model runtime configuration propagated to response generator (e.g., reasoning/tool parser)
     runtime_config: crate::local_model::runtime_config::ModelRuntimeConfig,
     tool_call_parser: Option<String>,
+    /// Bounds concurrent spawn_blocking tokenization tasks to avoid thread pool
+    /// contention. At high concurrency (60-100 requests) with long prompts (~4k
+    /// tokens, ~10ms each), an unbounded spawn_blocking pool causes 3-5x p50
+    /// latency regression from scheduling overhead. Capping to num_cores keeps
+    /// the blocking pool right-sized.
+    tokenize_semaphore: Arc<Semaphore>,
     #[cfg(feature = "media-nixl")]
     media_loader: Option<MediaLoader>,
 }
@@ -159,6 +166,10 @@ impl OpenAIPreprocessor {
             None => None,
         };
 
+        let tokenize_concurrency = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(4);
+
         Ok(Arc::new(Self {
             formatter,
             tokenizer,
@@ -167,6 +178,7 @@ impl OpenAIPreprocessor {
             lora_name,
             runtime_config,
             tool_call_parser,
+            tokenize_semaphore: Arc::new(Semaphore::new(tokenize_concurrency)),
             #[cfg(feature = "media-nixl")]
             media_loader,
         }))
@@ -174,6 +186,31 @@ impl OpenAIPreprocessor {
     /// Encode a string to it's tokens
     pub fn tokenize(&self, s: &str) -> anyhow::Result<Encoding> {
         self.tokenizer.encode(s)
+    }
+
+    /// Tokenize a string on the blocking thread pool with bounded concurrency.
+    ///
+    /// Acquires a semaphore permit before spawning to prevent thread pool
+    /// contention when many requests arrive simultaneously.
+    async fn tokenize_async(&self, text: String) -> Result<Encoding> {
+        let _permit = self.tokenize_semaphore.acquire().await.map_err(|e| {
+            anyhow::anyhow!("tokenize semaphore closed: {}", e)
+        })?;
+        let tokenizer = self.tokenizer.clone();
+        tokio::task::spawn_blocking(move || tokenizer.encode(&text))
+            .await?
+    }
+
+    /// Batch-tokenize strings on the blocking thread pool with bounded concurrency.
+    async fn tokenize_batch_async(&self, texts: Vec<String>) -> Result<Vec<Encoding>> {
+        let _permit = self.tokenize_semaphore.acquire().await.map_err(|e| {
+            anyhow::anyhow!("tokenize semaphore closed: {}", e)
+        })?;
+        let tokenizer = self.tokenizer.clone();
+        tokio::task::spawn_blocking(move || {
+            tokenizer.encode_batch(&texts.iter().map(|s| s.as_str()).collect::<Vec<_>>())
+        })
+        .await?
     }
 
     /// Translate a [`NvCreateChatCompletionRequest`] request to a common completion request.
@@ -461,20 +498,12 @@ impl OpenAIPreprocessor {
                                     tracing::warn!(
                                         "backend_instance_id provided but no token_data; tokenizing prompt"
                                     );
-                                    let tokenizer = self.tokenizer.clone();
-                                    let prompt_owned = prompt.clone();
-                                    let encoding = tokio::task::spawn_blocking(move || {
-                                        tokenizer.encode(&prompt_owned)
-                                    }).await??;
+                                    let encoding = self.tokenize_async(prompt.clone()).await?;
                                     (encoding.token_ids().to_vec(), false)
                                 }
                             } else {
                                 // No backend_instance_id provided, continue the normal flow.
-                                let tokenizer = self.tokenizer.clone();
-                                let prompt_owned = prompt.clone();
-                                let encoding = tokio::task::spawn_blocking(move || {
-                                    tokenizer.encode(&prompt_owned)
-                                }).await??;
+                                let encoding = self.tokenize_async(prompt.clone()).await?;
                                 (encoding.token_ids().to_vec(), false)
                             };
 
@@ -491,11 +520,7 @@ impl OpenAIPreprocessor {
                         }
                         TextInput::Batch(texts) => {
                             if texts.len() == 1 {
-                                let tokenizer = self.tokenizer.clone();
-                                let text_owned = texts[0].clone();
-                                let encoding = tokio::task::spawn_blocking(move || {
-                                    tokenizer.encode(&text_owned)
-                                }).await??;
+                                let encoding = self.tokenize_async(texts[0].clone()).await?;
                                 builder.token_ids(encoding.token_ids().to_vec());
                             } else {
                                 bail!(
@@ -526,28 +551,16 @@ impl OpenAIPreprocessor {
 
         let all_token_ids = match &request.inner.input {
             dynamo_async_openai::types::EmbeddingInput::String(s) => {
-                let tokenizer = self.tokenizer.clone();
-                let s_owned = s.clone();
-                let encoding = tokio::task::spawn_blocking(move || {
-                    tokenizer.encode(&s_owned)
-                }).await??;
+                let encoding = self.tokenize_async(s.clone()).await?;
                 vec![encoding.token_ids().to_vec()]
             }
             dynamo_async_openai::types::EmbeddingInput::StringArray(arr) => {
                 let input_strs: Vec<String> = arr.to_vec();
-                let encodings = tokio::task::spawn_blocking({
-                    let tokenizer = self.tokenizer.clone();
-                    let strs = input_strs.clone();
-                    move || {
-                        tokenizer.encode_batch(&strs.iter().map(|s| s.as_str()).collect::<Vec<_>>())
-                    }
-                })
-                .await??;
-                let token_arrays: Vec<Vec<u32>> = encodings
+                let encodings = self.tokenize_batch_async(input_strs).await?;
+                encodings
                     .into_iter()
                     .map(|encoding| encoding.token_ids().to_vec())
-                    .collect();
-                token_arrays
+                    .collect()
             }
             dynamo_async_openai::types::EmbeddingInput::IntegerArray(token_ids) => {
                 vec![token_ids.clone()]
